@@ -1,9 +1,23 @@
 [project]
-name = "fastapi-request-observability-python"
+name = "fastapi-request-observability"
 version = "0.1.0"
+description = "FastAPI 请求级可观测性：关联标识、结构化记录、指标汇总与阈值告警"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.*",
 ]
 
 [[tool.uv.index]]

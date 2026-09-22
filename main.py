@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""模块入口：暴露与骨架阶段一致的 app 对象。"""
 
-app = FastAPI()
+from app import build_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = build_app()
