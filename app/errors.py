@@ -22,6 +22,7 @@ class ErrorType(str, Enum):
     BUSINESS_ERROR = "business_error"
     RATE_LIMITED = "rate_limited"
     TIMEOUT_ERROR = "timeout_error"
+    NETWORK_SYSTEM_ERROR = "network_system_error"
     UNCAUGHT_ERROR = "uncaught_error"
 
 
@@ -34,6 +35,8 @@ STATUS_BY_ERROR_TYPE: dict[ErrorType, int] = {
     ErrorType.RATE_LIMITED: 429,
     ErrorType.TIMEOUT_ERROR: 504,
     ErrorType.DEPENDENCY_ERROR: 502,
+    # 网络/系统级故障（连接被拒、连接中断、底层系统调用失败等）
+    ErrorType.NETWORK_SYSTEM_ERROR: 502,
     ErrorType.UNCAUGHT_ERROR: 500,
 }
 
@@ -46,11 +49,40 @@ SAFE_MESSAGE_BY_ERROR_TYPE: dict[ErrorType, str] = {
     ErrorType.RATE_LIMITED: "请求过于频繁",
     ErrorType.TIMEOUT_ERROR: "上游处理超时",
     ErrorType.DEPENDENCY_ERROR: "上游依赖异常",
+    ErrorType.NETWORK_SYSTEM_ERROR: "网络或系统错误",
     ErrorType.UNCAUGHT_ERROR: "服务内部错误",
 }
 
 # 超时异常类名/模块片段 -> 错误类型
 _TIMEOUT_TYPE_NAMES = {"TimeoutError", "asyncio.TimeoutError", "ReadTimeout"}
+
+#: 网络/系统级故障异常类名（连接被拒、连接中断、DNS、系统调用失败等）。
+#: 仅匹配来自标准库/常见网络库的具体异常名，普通业务异常不会误伤。
+_NETWORK_SYSTEM_TYPE_NAMES = {
+    # socket / 内置 OSError 子类
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "InterruptedError",
+    "gaierror",
+    "herror",
+    "SSLError",
+    "SSLEOFError",
+    # http.client / urllib3 的连接与协议中断
+    "RemoteDisconnected",
+    "ProtocolError",
+    "MaxRetryError",
+    "NewConnectionError",
+    # asyncio 传输层
+    "ClientConnectionError",
+    "ClientConnectorError",
+    "ClientConnectorDNSError",
+    "ClientConnectorSSLError",
+    "ClientConnectorCertificateError",
+    "ServerDisconnectedError",
+}
 
 
 class ObservabilityError(Exception):
@@ -93,8 +125,12 @@ def classify_exception(exc: BaseException) -> tuple[ErrorType, int, str]:
     返回 ``(错误类型, HTTP 状态码, 对外安全消息)``。
     归类依据（按优先级）：
       1. 已知业务异常基类（见 app.errors 兼容，或路由模块自定义）；
-      2. 超时类异常名 -> timeout_error(504)；
-      3. 其余一律 uncaught_error(500)。
+      2. 超时类异常名 -> timeout_error(504)（含内置 TimeoutError）；
+      3. 内置连接类异常 ``ConnectionError``（含 ConnectionRefusedError/
+         ConnectionResetError/BrokenPipeError 等）或网络库具体连接/系统级
+         异常名 -> network_system_error(502)；普通文件类 OSError
+         （如 FileNotFoundError）不在此列，仍归 uncaught_error；
+      4. 其余一律 uncaught_error(500)。
     """
     name = type(exc).__name__
     if isinstance(exc, ObservabilityError):
@@ -103,6 +139,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorType, int, str]:
         et = _CLASSIFICATION_BY_TYPE[name]
     elif name in _TIMEOUT_TYPE_NAMES or "timeout" in name.lower():
         et = ErrorType.TIMEOUT_ERROR
+    elif isinstance(exc, ConnectionError) or name in _NETWORK_SYSTEM_TYPE_NAMES:
+        et = ErrorType.NETWORK_SYSTEM_ERROR
     else:
         et = ErrorType.UNCAUGHT_ERROR
     return et, STATUS_BY_ERROR_TYPE[et], SAFE_MESSAGE_BY_ERROR_TYPE[et]

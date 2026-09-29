@@ -19,6 +19,14 @@ class RequestIdSettings:
     valid_pattern: str = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
     #: 调用方提供标识的最大长度
     max_length: int = 128
+    #: 入口即被拒绝（标识非法）的请求，用于贯穿日志/明细的专属标识前缀
+    rejected_prefix: str = "rej-"
+    #: 出站传播头名：业务调下游时原样携带本请求标识
+    outbound_header_name: str = "X-Request-ID"
+    #: 出站传播默认开启；调第三方等场景可通过环境变量关闭
+    outbound_propagation_enabled: bool = True
+    #: 从下游响应中读取其本次标识的响应头名
+    downstream_id_header_name: str = "X-Downstream-Request-ID"
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,9 @@ class AlertSettings:
 class MetricsSettings:
     #: 近期请求明细的保留条数上界（环形缓冲容量）
     recent_records_capacity: int = 200
+    #: 入口被挡请求（非法标识等）专用明细缓冲容量上界；
+    #: 与正常请求缓冲相互独立，被扫爆时不会顶掉正常请求明细
+    recent_rejected_capacity: int = 200
     #: 耗时区间边界（毫秒，左闭右开，最后一档为溢出档）
     latency_buckets_ms: tuple[int, ...] = (50, 100, 200, 500, 1000)
 
@@ -60,14 +71,28 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw not in (None, "") else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_settings() -> Settings:
     """读取默认配置；告警阈值支持通过环境变量覆盖。
 
     环境变量：
       OBS_ALERT_WINDOW_SECONDS / OBS_ALERT_MIN_REQUESTS /
       OBS_ALERT_ERROR_RATE_THRESHOLD / OBS_ALERT_LATENCY_THRESHOLD_MS /
-      OBS_METRICS_RECENT_CAPACITY
+      OBS_METRICS_RECENT_CAPACITY / OBS_METRICS_RECENT_REJECTED_CAPACITY /
+      OBS_OUTBOUND_PROPAGATION_ENABLED
     """
+    request_id = RequestIdSettings(
+        outbound_propagation_enabled=_env_bool(
+            "OBS_OUTBOUND_PROPAGATION_ENABLED",
+            RequestIdSettings.outbound_propagation_enabled,
+        ),
+    )
     alert = AlertSettings(
         window_seconds=_env_float("OBS_ALERT_WINDOW_SECONDS", AlertSettings.window_seconds),
         min_requests=_env_int("OBS_ALERT_MIN_REQUESTS", AlertSettings.min_requests),
@@ -82,5 +107,9 @@ def get_settings() -> Settings:
         recent_records_capacity=_env_int(
             "OBS_METRICS_RECENT_CAPACITY", MetricsSettings.recent_records_capacity
         ),
+        recent_rejected_capacity=_env_int(
+            "OBS_METRICS_RECENT_REJECTED_CAPACITY",
+            MetricsSettings.recent_rejected_capacity,
+        ),
     )
-    return Settings(alert=replace(alert), metrics=metrics)
+    return Settings(request_id=request_id, alert=replace(alert), metrics=metrics)

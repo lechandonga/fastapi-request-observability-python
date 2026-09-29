@@ -20,8 +20,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .errors import ErrorType, STATUS_BY_ERROR_TYPE, classify_exception, build_error_body
 from .logging_setup import access_logger, diagnostic_logger
 from .metrics import MetricsRegistry, RequestRecord
+from .propagation import get_downstream_ids, reset_downstream_ids
 from .request_id import (
     InvalidRequestId,
+    generate_rejected_request_id,
     resolve_request_id,
     set_request_id,
     reset_request_id,
@@ -55,17 +57,26 @@ class ObservabilityMiddleware:
         raw = self._extract_header(scope)
         request_id, invalid = resolve_request_id(raw)
         if invalid is not None:
-            await self._send_invalid_id(scope, send, invalid)
-            # 被拒请求同样计入结构化记录（固定端点桶，request_id 留空）
+            # 入口被挡也要有本次专属标识：贯穿响应体/日志/回溯明细，
+            # 但按既有规则不通过 X-Request-ID 响应头回传
+            rejected_id = generate_rejected_request_id()
+            rej_token = set_request_id(rejected_id)
+            try:
+                await self._send_invalid_id(scope, send, invalid, rejected_id)
+            finally:
+                reset_request_id(rej_token)
+            # 被拒请求计入结构化记录（固定端点桶），进独立的有界明细缓冲
             self._registry.record(
                 RequestRecord(
-                    request_id="",
+                    request_id=rejected_id,
                     endpoint=_INVALID_ID_ENDPOINT,
                     method=method,
                     status_code=STATUS_BY_ERROR_TYPE[ErrorType.INVALID_REQUEST_ID],
                     duration_ms=(time.perf_counter() - started) * 1000.0,
                     error_type=ErrorType.INVALID_REQUEST_ID,
                     timestamp=started_wall,
+                    reject_reason=invalid.reason,
+                    rejected=True,
                 )
             )
             return
@@ -121,6 +132,7 @@ class ObservabilityMiddleware:
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
             endpoint = self._endpoint_name(scope)
+            downstream_ids = get_downstream_ids()
             # 下游异常处理器已把归类结果写入 scope；未捕获异常来自 except 分支。
             # 必须先解析出最终 error_type，再构造 RequestRecord。
             if error_type is None:
@@ -139,6 +151,7 @@ class ObservabilityMiddleware:
                 duration_ms=duration_ms,
                 error_type=error_type,
                 timestamp=started_wall,
+                downstream_ids=downstream_ids or None,
             )
             alerts = self._registry.record(record)
             for event in alerts:
@@ -152,8 +165,10 @@ class ObservabilityMiddleware:
                     "duration_ms": round(duration_ms, 3),
                     "error_type": error_type.value if error_type else None,
                     "alerts": [e.alert_id for e in alerts],
+                    "downstream_ids": downstream_ids or None,
                 },
             )
+            reset_downstream_ids()
             reset_request_id(token)
 
     # ------------------------------------------------------------------ #
@@ -171,10 +186,13 @@ class ObservabilityMiddleware:
         # 未匹配路由（404 等）归入固定桶，避免高基数
         return _UNMATCHED_ENDPOINT
 
-    async def _send_invalid_id(self, scope: Scope, send: Send, invalid: InvalidRequestId) -> None:
-        # 非法标识不生成上下文标识，响应头按规则不带该标识
+    async def _send_invalid_id(
+        self, scope: Scope, send: Send, invalid: InvalidRequestId, rejected_id: str
+    ) -> None:
+        # 对外拒绝规则与状态码不变：400 且响应头不带 X-Request-ID；
+        # 专属标识放在响应体 request_id 字段，便于与日志/明细对账
         body = {
-            "request_id": None,
+            "request_id": rejected_id,
             "error": {
                 "type": ErrorType.INVALID_REQUEST_ID.value,
                 "message": "请求标识非法",
@@ -189,7 +207,11 @@ class ObservabilityMiddleware:
         )
         access_logger.warning(
             "rejected invalid request id",
-            extra={"path": scope.get("path"), "reason": invalid.reason},
+            extra={
+                "path": scope.get("path"),
+                "reason": invalid.reason,
+                "rejected_request_id": rejected_id,
+            },
         )
 
     async def _send_error(

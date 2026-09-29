@@ -21,6 +21,11 @@ from .exception_handlers import register_exception_handlers
 from .logging_setup import configure_logging
 from .metrics import AlertEvent, MetricsRegistry, RequestRecord
 from .middleware import ObservabilityMiddleware
+from .propagation import (
+    build_outbound_headers,
+    capture_downstream_response,
+    get_downstream_ids,
+)
 from .request_id import get_request_id
 
 
@@ -44,6 +49,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         alert_settings=cfg.alert,
         recent_capacity=cfg.metrics.recent_records_capacity,
         latency_buckets_ms=cfg.metrics.latency_buckets_ms,
+        rejected_capacity=cfg.metrics.recent_rejected_capacity,
     )
     # 暴露给测试与查询路由
     app.state.registry = registry
@@ -101,6 +107,58 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         await asyncio.sleep(ms / 1000.0)
         return {"request_id": get_request_id(), "slept_ms": ms}
 
+    # ------------------------------------------------------------------
+    # 跨服务链路：本地模拟"发起下游调用 -> 透传标识 -> 回收下游标识"，
+    # 不依赖任何外部服务。
+    # ------------------------------------------------------------------
+    @app.get("/demo/downstream-call")
+    async def demo_downstream_call(
+        propagate: bool | None = Query(None),
+        reply: bool = Query(True),
+    ) -> dict:
+        """模拟对下游的调用。
+
+        - ``propagate=false`` 模拟本次关闭出站传播（如调第三方）；不传则跟随全局开关；
+        - ``reply=false`` 模拟下游不回传它那一次的标识。
+        """
+        headers = build_outbound_headers(
+            downstream="simulated-downstream",
+            enabled=propagate,
+            settings=cfg.request_id,
+        )
+        # 本地模拟下游：收到标识则沿用同一条链路，并回自己那一次的标识
+        inbound = headers.get(cfg.request_id.outbound_header_name)
+        downstream_resp_headers: dict[str, str] = {}
+        if reply and inbound:
+            downstream_resp_headers[cfg.request_id.downstream_id_header_name] = (
+                f"down-{inbound}"
+            )
+        captured = capture_downstream_response(
+            downstream_resp_headers,
+            downstream="simulated-downstream",
+            settings=cfg.request_id,
+        )
+        return {
+            "request_id": get_request_id(),
+            "outbound_headers": headers,
+            "captured_downstream_id": captured,
+            "all_downstream_ids": get_downstream_ids(),
+        }
+
+    @app.get("/demo/network-error")
+    def demo_network_error() -> dict:
+        """连接被拒：模拟连内部依赖（含主机/端口敏感细节）。"""
+        raise ConnectionRefusedError(
+            111, "Connection refused (10.0.0.7:6379) secret host port"
+        )
+
+    @app.get("/demo/system-error")
+    def demo_system_error() -> dict:
+        """连接中断：对端重置 TCP 连接（底层系统调用失败）。"""
+        raise ConnectionResetError(
+            104, "Connection reset by peer during socket.read() at 10.0.0.9:443"
+        )
+
     # ------------------------------------------------------------------ #
     @app.get("/observability/metrics")
     def get_metrics(endpoint: str | None = None) -> dict:
@@ -116,10 +174,30 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/observability/recent")
-    def get_recent(limit: int = Query(20, ge=1, le=200)) -> dict:
-        records = registry.recent(limit=limit)
+    def get_recent(
+        limit: int = Query(20, ge=1, le=200),
+        include: str = Query("normal", pattern="^(normal|rejected|all)$"),
+        request_id: str | None = Query(None),
+    ) -> dict:
+        """近期请求明细（新 -> 旧，有硬容量上界）。
+
+        - ``include=normal``（默认）只看正常请求；``rejected`` 只看入口
+          被挡请求（独立有界缓冲）；``all`` 两类合并；
+        - ``request_id=...`` 跨两份缓冲按标识精确对账（用于被拒请求追踪）。
+        """
+        if request_id is not None:
+            records = registry.find_by_request_id(request_id)[:limit]
+        elif include == "rejected":
+            records = registry.recent_rejected(limit=limit)
+        elif include == "all":
+            records = (registry.recent() + registry.recent_rejected())[:limit]
+        else:
+            records = registry.recent(limit=limit)
         return {
             "capacity": cfg.metrics.recent_records_capacity,
+            "rejected_capacity": cfg.metrics.recent_rejected_capacity,
+            "include": include,
+            "query_request_id": request_id,
             "returned": len(records),
             "records": [_record_to_dict(r) for r in records],
         }

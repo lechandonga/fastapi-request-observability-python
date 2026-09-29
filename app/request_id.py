@@ -74,6 +74,16 @@ def generate_request_id(settings: RequestIdSettings | None = None) -> str:
     return f"{cfg.prefix}{uuid.uuid4().hex}"
 
 
+def generate_rejected_request_id(settings: RequestIdSettings | None = None) -> str:
+    """为入口即被挡的请求生成本次专属标识（``rej-`` 前缀）。
+
+    语义与正常生成标识不同（专属前缀），便于在日志/明细里一眼区分，
+    但同样保证并发不碰撞；该标识不通过 ``X-Request-ID`` 响应头回传。
+    """
+    cfg = settings or get_settings().request_id
+    return f"{cfg.rejected_prefix}{uuid.uuid4().hex}"
+
+
 def resolve_request_id(
     raw: str | None, settings: RequestIdSettings | None = None
 ) -> tuple[str | None, InvalidRequestId | None]:
