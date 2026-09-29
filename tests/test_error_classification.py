@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi.testclient import TestClient
 
 SECRET_MARKERS = [
@@ -76,8 +78,23 @@ def test_invalid_request_id_rejected(client: TestClient):
     r = client.get("/echo", params={"msg": "x"}, headers={"X-Request-ID": "bad id!"})
     print(f"[判定] status={r.status_code}, body={r.json()}")
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "invalid_request_id"
-    assert r.headers.get("x-request-id") in (None, "")
+    body = r.json()
+    assert body["error"]["type"] == "invalid_request_id"
+    # 被拒请求也有本次专属标识：响应头与响应体对得上，原始非法值不回显
+    rejection_id = r.headers["x-request-id"]
+    assert re.fullmatch(r"req-[0-9a-f]{32}", rejection_id)
+    assert body["request_id"] == rejection_id
+    assert "bad id!" not in r.text
+    # 拿该标识能在近期回溯明细里查到被拒记录与原因
+    found = client.get(
+        "/observability/recent", params={"request_id": rejection_id}
+    ).json()["records"]
+    print(f"[判定] 按标识查到被拒明细 {len(found)} 条: {found}")
+    assert len(found) == 1
+    assert found[0]["rejected"] is True
+    assert found[0]["status_code"] == 400
+    assert found[0]["endpoint"] == "__invalid_request_id__"
+    assert "非法字符" in (found[0]["reject_reason"] or "")
 
 
 def test_root_compatibility(client: TestClient):

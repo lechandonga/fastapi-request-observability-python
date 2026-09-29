@@ -22,9 +22,16 @@ from .logging_setup import access_logger, diagnostic_logger
 from .metrics import MetricsRegistry, RequestRecord
 from .request_id import (
     InvalidRequestId,
+    generate_request_id,
     resolve_request_id,
     set_request_id,
     reset_request_id,
+)
+from .propagation import (
+    get_downstream_id,
+    reset_request_scope,
+    reset_propagation_scope,
+    set_propagation_scope,
 )
 
 _UNMATCHED_ENDPOINT = "__unmatched__"
@@ -38,9 +45,11 @@ class ObservabilityMiddleware:
         app: ASGIApp,
         registry: MetricsRegistry,
         header_name: str,
+        propagation_enabled: bool = True,
     ) -> None:
         self.app = app
         self._registry = registry
+        self._propagation_enabled = propagation_enabled
         # ASGI 头键必须为小写 bytes
         self._header_bytes = header_name.lower().encode("latin-1")
 
@@ -55,23 +64,29 @@ class ObservabilityMiddleware:
         raw = self._extract_header(scope)
         request_id, invalid = resolve_request_id(raw)
         if invalid is not None:
-            await self._send_invalid_id(scope, send, invalid)
-            # 被拒请求同样计入结构化记录（固定端点桶，request_id 留空）
+            # 入口即被拒绝的请求也生成本次专属标识，贯穿响应/日志/回溯明细
+            rejection_id = generate_request_id()
+            token = set_request_id(rejection_id)
+            await self._send_invalid_id(scope, send, invalid, rejection_id)
             self._registry.record(
                 RequestRecord(
-                    request_id="",
+                    request_id=rejection_id,
                     endpoint=_INVALID_ID_ENDPOINT,
                     method=method,
                     status_code=STATUS_BY_ERROR_TYPE[ErrorType.INVALID_REQUEST_ID],
                     duration_ms=(time.perf_counter() - started) * 1000.0,
                     error_type=ErrorType.INVALID_REQUEST_ID,
                     timestamp=started_wall,
+                    rejected=True,
+                    reject_reason=invalid.reason,
                 )
             )
+            reset_request_id(token)
             return
 
         # 绑定到本请求的上下文；中间件 await 链中的内部调用读取的都是该值
         token = set_request_id(request_id)
+        prop_token = set_propagation_scope(self._propagation_enabled)
         status_code = 500
         error_type: ErrorType | None = None
         response_started = False
@@ -139,6 +154,7 @@ class ObservabilityMiddleware:
                 duration_ms=duration_ms,
                 error_type=error_type,
                 timestamp=started_wall,
+                downstream_request_id=get_downstream_id() or None,
             )
             alerts = self._registry.record(record)
             for event in alerts:
@@ -152,9 +168,12 @@ class ObservabilityMiddleware:
                     "duration_ms": round(duration_ms, 3),
                     "error_type": error_type.value if error_type else None,
                     "alerts": [e.alert_id for e in alerts],
+                    "downstream_request_id": get_downstream_id() or None,
                 },
             )
+            reset_request_scope()
             reset_request_id(token)
+            reset_propagation_scope(prop_token)
 
     # ------------------------------------------------------------------ #
     def _extract_header(self, scope: Scope) -> str | None:
@@ -171,10 +190,16 @@ class ObservabilityMiddleware:
         # 未匹配路由（404 等）归入固定桶，避免高基数
         return _UNMATCHED_ENDPOINT
 
-    async def _send_invalid_id(self, scope: Scope, send: Send, invalid: InvalidRequestId) -> None:
-        # 非法标识不生成上下文标识，响应头按规则不带该标识
+    async def _send_invalid_id(
+        self,
+        scope: Scope,
+        send: Send,
+        invalid: InvalidRequestId,
+        rejection_id: str,
+    ) -> None:
+        # 调用方原始非法值绝不回显；响应带本次专属的拒绝标识，供双方对账
         body = {
-            "request_id": None,
+            "request_id": rejection_id,
             "error": {
                 "type": ErrorType.INVALID_REQUEST_ID.value,
                 "message": "请求标识非法",
@@ -185,11 +210,15 @@ class ObservabilityMiddleware:
             send,
             STATUS_BY_ERROR_TYPE[ErrorType.INVALID_REQUEST_ID],
             body,
-            request_id=None,
+            request_id=rejection_id,
         )
         access_logger.warning(
             "rejected invalid request id",
-            extra={"path": scope.get("path"), "reason": invalid.reason},
+            extra={
+                "path": scope.get("path"),
+                "reason": invalid.reason,
+                "rejected": True,
+            },
         )
 
     async def _send_error(

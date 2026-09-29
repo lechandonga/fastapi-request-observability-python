@@ -19,6 +19,7 @@ class ErrorType(str, Enum):
     VALIDATION_ERROR = "validation_error"
     NOT_FOUND = "not_found"
     DEPENDENCY_ERROR = "dependency_error"
+    NETWORK_ERROR = "network_error"
     BUSINESS_ERROR = "business_error"
     RATE_LIMITED = "rate_limited"
     TIMEOUT_ERROR = "timeout_error"
@@ -34,6 +35,7 @@ STATUS_BY_ERROR_TYPE: dict[ErrorType, int] = {
     ErrorType.RATE_LIMITED: 429,
     ErrorType.TIMEOUT_ERROR: 504,
     ErrorType.DEPENDENCY_ERROR: 502,
+    ErrorType.NETWORK_ERROR: 502,
     ErrorType.UNCAUGHT_ERROR: 500,
 }
 
@@ -46,11 +48,40 @@ SAFE_MESSAGE_BY_ERROR_TYPE: dict[ErrorType, str] = {
     ErrorType.RATE_LIMITED: "请求过于频繁",
     ErrorType.TIMEOUT_ERROR: "上游处理超时",
     ErrorType.DEPENDENCY_ERROR: "上游依赖异常",
+    ErrorType.NETWORK_ERROR: "网络或系统级故障",
     ErrorType.UNCAUGHT_ERROR: "服务内部错误",
 }
 
 # 超时异常类名/模块片段 -> 错误类型
 _TIMEOUT_TYPE_NAMES = {"TimeoutError", "asyncio.TimeoutError", "ReadTimeout"}
+
+#: 网络/系统级故障异常类名（标准库及常见第三方库的连接/系统调用异常）。
+#: 仅按类型名稳定识别，异常原文（含主机/端口/errno 文本）绝不进响应体。
+_NETWORK_TYPE_NAMES = {
+    # 标准库 socket/ssl/asyncio
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "OSError",
+    "SocketError",
+    "gaierror",
+    "SSLError",
+    "SSLZeroReturnError",
+    "SSLSyscallError",
+    "ClientConnectorError",
+    "ClientConnectionResetError",
+    "ClientConnectionError",
+    "ServerDisconnectedError",
+    "ConnectError",
+    "ReadError",
+    "WriteError",
+    "NetworkError",
+}
+
+#: 归类为网络/系统级故障的标准库基类（按 isinstance 稳定识别）
+_NETWORK_BASE_CLASSES: tuple[type[BaseException], ...] = (ConnectionError, OSError)
 
 
 class ObservabilityError(Exception):
@@ -94,7 +125,9 @@ def classify_exception(exc: BaseException) -> tuple[ErrorType, int, str]:
     归类依据（按优先级）：
       1. 已知业务异常基类（见 app.errors 兼容，或路由模块自定义）；
       2. 超时类异常名 -> timeout_error(504)；
-      3. 其余一律 uncaught_error(500)。
+      3. 网络/系统级故障（连接被拒、连接中断、底层系统调用失败等）
+         -> network_error(502)；
+      4. 其余一律 uncaught_error(500)。
     """
     name = type(exc).__name__
     if isinstance(exc, ObservabilityError):
@@ -103,6 +136,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorType, int, str]:
         et = _CLASSIFICATION_BY_TYPE[name]
     elif name in _TIMEOUT_TYPE_NAMES or "timeout" in name.lower():
         et = ErrorType.TIMEOUT_ERROR
+    elif isinstance(exc, _NETWORK_BASE_CLASSES) or name in _NETWORK_TYPE_NAMES:
+        et = ErrorType.NETWORK_ERROR
     else:
         et = ErrorType.UNCAUGHT_ERROR
     return et, STATUS_BY_ERROR_TYPE[et], SAFE_MESSAGE_BY_ERROR_TYPE[et]

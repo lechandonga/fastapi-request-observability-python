@@ -60,6 +60,12 @@ class RequestRecord:
     duration_ms: float
     error_type: ErrorType | None
     timestamp: float
+    #: 是否为入口即被拒绝的请求（非法标识等），走独立有界缓冲
+    rejected: bool = False
+    #: 拒绝原因（仅被拒请求使用，承载安全可解释文本）
+    reject_reason: str | None = None
+    #: 下游响应回传的标识（跨服务链路关联）
+    downstream_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,10 +113,15 @@ class MetricsRegistry:
         alert_settings: AlertSettings,
         recent_capacity: int,
         latency_buckets_ms: tuple[int, ...],
+        rejected_capacity: int | None = None,
     ) -> None:
         self._alert_settings = alert_settings
         self._buckets = tuple(latency_buckets_ms)
         self._recent: RingBuffer[RequestRecord] = RingBuffer(recent_capacity)
+        # 被拒请求独立缓冲：与正常明细容量各自硬上界，互不挤占
+        self._rejected: RingBuffer[RequestRecord] = RingBuffer(
+            rejected_capacity if rejected_capacity is not None else recent_capacity
+        )
         self._alerts: RingBuffer[AlertEvent] = RingBuffer(_ALERT_CAPACITY)
         # 端点 -> 窗口样本
         self._windows: dict[str, deque[_Sample]] = {}
@@ -126,7 +137,10 @@ class MetricsRegistry:
         """记录一次请求，返回本次新产生的告警事件（通常 0~2 条）。"""
         current = time.time() if now is None else now
         with self._lock:
-            self._recent.add(rec)
+            if rec.rejected:
+                self._rejected.add(rec)
+            else:
+                self._recent.add(rec)
             self._cumulative[rec.endpoint] = self._cumulative.get(rec.endpoint, 0) + 1
             window = self._windows.setdefault(rec.endpoint, deque())
             self._prune(rec.endpoint, current)
@@ -288,10 +302,33 @@ class MetricsRegistry:
                     out.append(m)
             return sorted(out, key=lambda m: m.endpoint)
 
-    def recent(self, limit: int | None = None) -> list[RequestRecord]:
-        """近期明细，新 -> 旧；limit 截断。受环形缓冲容量上界约束。"""
-        items = self._recent.snapshot()[::-1]
+    def recent(
+        self,
+        limit: int | None = None,
+        *,
+        request_id: str | None = None,
+        include_rejected: bool = True,
+    ) -> list[RequestRecord]:
+        """近期明细，新 -> 旧；limit 截断。
+
+        合并正常明细与被拒明细（各自受环形缓冲容量硬上界约束），
+        按时间戳倒序；``request_id`` 非空时只返回该标识对应的记录，
+        用于"拿标识查回溯"。
+        """
+        with self._lock:
+            items = self._recent.snapshot()
+            if include_rejected:
+                items = items + self._rejected.snapshot()
+        if request_id is not None:
+            items = [r for r in items if r.request_id == request_id]
+        items.sort(key=lambda r: r.timestamp, reverse=True)
         return items if limit is None else items[:limit]
+
+    def recent_capacity(self) -> int:
+        return self._recent.capacity
+
+    def rejected_capacity(self) -> int:
+        return self._rejected.capacity
 
     def alerts(self) -> list[AlertEvent]:
         return self._alerts.snapshot()
@@ -300,6 +337,7 @@ class MetricsRegistry:
         """测试/运维复位。"""
         with self._lock:
             self._recent.clear()
+            self._rejected.clear()
             self._alerts.clear()
             self._windows.clear()
             self._cumulative.clear()

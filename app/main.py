@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 
+import httpx
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
@@ -21,6 +22,13 @@ from .exception_handlers import register_exception_handlers
 from .logging_setup import configure_logging
 from .metrics import AlertEvent, MetricsRegistry, RequestRecord
 from .middleware import ObservabilityMiddleware
+from .propagation import (
+    capture_downstream_id,
+    get_downstream_id,
+    outbound_headers,
+    reset_propagation_scope,
+    set_propagation_scope,
+)
 from .request_id import get_request_id
 
 
@@ -44,6 +52,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         alert_settings=cfg.alert,
         recent_capacity=cfg.metrics.recent_records_capacity,
         latency_buckets_ms=cfg.metrics.latency_buckets_ms,
+        rejected_capacity=cfg.metrics.rejected_records_capacity,
     )
     # 暴露给测试与查询路由
     app.state.registry = registry
@@ -53,6 +62,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         ObservabilityMiddleware,
         registry=registry,
         header_name=cfg.request_id.header_name,
+        propagation_enabled=cfg.propagation.enabled,
     )
     register_exception_handlers(app, header_name=cfg.request_id.header_name)
 
@@ -96,10 +106,69 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     async def demo_timeout() -> dict:
         raise asyncio.TimeoutError()
 
+    @app.get("/demo/network-error")
+    def demo_network_error() -> dict:
+        # 连接被拒：errno 文本含内部主机/端口，只落日志，不进响应体
+        raise ConnectionRefusedError(111, "Connection refused 10.0.0.9:6379")
+
+    @app.get("/demo/system-error")
+    def demo_system_error() -> dict:
+        # 底层系统调用失败（OSError），归类为 network_error
+        raise OSError(5, "Input/output error at /dev/internal")
+
     @app.get("/demo/slow")
     async def demo_slow(ms: int = Query(600, ge=0, le=10000)) -> dict:
         await asyncio.sleep(ms / 1000.0)
         return {"request_id": get_request_id(), "slept_ms": ms}
+
+    # ---- 跨服务链路联调（进程内下游，不依赖任何外部服务）---------------- #
+    downstream = FastAPI(title="downstream-demo")
+
+    downstream_registry = MetricsRegistry(
+        alert_settings=cfg.alert,
+        recent_capacity=10,
+        latency_buckets_ms=cfg.metrics.latency_buckets_ms,
+        rejected_capacity=10,
+    )
+    downstream.add_middleware(
+        ObservabilityMiddleware,
+        registry=downstream_registry,
+        header_name=cfg.request_id.header_name,
+        propagation_enabled=False,
+    )
+    app.state.downstream_registry = downstream_registry
+
+    @downstream.get("/ping")
+    def downstream_ping() -> dict:
+        # 收到上游标识则沿用同一条链路；缺失时下游自行生成
+        return {"downstream_request_id": get_request_id()}
+
+    @app.get("/demo/downstream-call")
+    async def demo_downstream_call(propagate: bool | None = None) -> dict:
+        """演示出站传播：默认携带本次标识；propagate=false 模拟调第三方不外发。
+
+        不传参时跟随全局配置（默认开启）。
+        """
+        token = (
+            set_propagation_scope(propagate)
+            if propagate is not None
+            else None
+        )
+        headers = outbound_headers({"X-Demo": "local"})
+        transport = httpx.ASGITransport(app=downstream)
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://downstream") as client:
+                resp = await client.get("/ping", headers=headers)
+            captured = capture_downstream_id(resp)
+        finally:
+            if token is not None:
+                reset_propagation_scope(token)
+        return {
+            "request_id": get_request_id(),
+            "sent_header": headers.get(cfg.propagation.header_name),
+            "downstream_request_id": captured,
+            "associated_downstream_id": get_downstream_id(),
+        }
 
     # ------------------------------------------------------------------ #
     @app.get("/observability/metrics")
@@ -116,11 +185,19 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/observability/recent")
-    def get_recent(limit: int = Query(20, ge=1, le=200)) -> dict:
-        records = registry.recent(limit=limit)
+    def get_recent(
+        limit: int = Query(20, ge=1, le=400),
+        request_id: str | None = Query(None),
+        include_rejected: bool = True,
+    ) -> dict:
+        records = registry.recent(
+            limit=limit, request_id=request_id, include_rejected=include_rejected
+        )
         return {
             "capacity": cfg.metrics.recent_records_capacity,
+            "rejected_capacity": cfg.metrics.rejected_records_capacity,
             "returned": len(records),
+            "filter": {"request_id": request_id, "include_rejected": include_rejected},
             "records": [_record_to_dict(r) for r in records],
         }
 

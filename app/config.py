@@ -22,6 +22,16 @@ class RequestIdSettings:
 
 
 @dataclass(frozen=True)
+class PropagationSettings:
+    """出站传播配置：把本次请求标识透传给下游。"""
+
+    #: 出站传播总开关，默认开启；调第三方时可关闭
+    enabled: bool = True
+    #: 传播标识使用的请求头名（出站携带、下游回传统一使用该头）
+    header_name: str = "X-Request-ID"
+
+
+@dataclass(frozen=True)
 class AlertSettings:
     #: 判定窗口（秒）：只统计最近该时长内的请求
     window_seconds: float = 60.0
@@ -39,6 +49,8 @@ class AlertSettings:
 class MetricsSettings:
     #: 近期请求明细的保留条数上界（环形缓冲容量）
     recent_records_capacity: int = 200
+    #: 入口被拒请求明细的独立保留条数上界（与正常明细互不挤占）
+    rejected_records_capacity: int = 200
     #: 耗时区间边界（毫秒，左闭右开，最后一档为溢出档）
     latency_buckets_ms: tuple[int, ...] = (50, 100, 200, 500, 1000)
 
@@ -46,6 +58,7 @@ class MetricsSettings:
 @dataclass(frozen=True)
 class Settings:
     request_id: RequestIdSettings = RequestIdSettings()
+    propagation: PropagationSettings = PropagationSettings()
     alert: AlertSettings = AlertSettings()
     metrics: MetricsSettings = MetricsSettings()
 
@@ -60,13 +73,21 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw not in (None, "") else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_settings() -> Settings:
     """读取默认配置；告警阈值支持通过环境变量覆盖。
 
     环境变量：
       OBS_ALERT_WINDOW_SECONDS / OBS_ALERT_MIN_REQUESTS /
       OBS_ALERT_ERROR_RATE_THRESHOLD / OBS_ALERT_LATENCY_THRESHOLD_MS /
-      OBS_METRICS_RECENT_CAPACITY
+      OBS_METRICS_RECENT_CAPACITY / OBS_METRICS_REJECTED_CAPACITY /
+      OBS_PROPAGATION_ENABLED
     """
     alert = AlertSettings(
         window_seconds=_env_float("OBS_ALERT_WINDOW_SECONDS", AlertSettings.window_seconds),
@@ -82,5 +103,12 @@ def get_settings() -> Settings:
         recent_records_capacity=_env_int(
             "OBS_METRICS_RECENT_CAPACITY", MetricsSettings.recent_records_capacity
         ),
+        rejected_records_capacity=_env_int(
+            "OBS_METRICS_REJECTED_CAPACITY",
+            MetricsSettings.rejected_records_capacity,
+        ),
     )
-    return Settings(alert=replace(alert), metrics=metrics)
+    propagation = PropagationSettings(
+        enabled=_env_bool("OBS_PROPAGATION_ENABLED", PropagationSettings.enabled),
+    )
+    return Settings(propagation=propagation, alert=replace(alert), metrics=metrics)

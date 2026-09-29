@@ -85,8 +85,11 @@ def test_mixed_valid_invalid_missing_concurrent(client: TestClient):
             assert r.status_code == 400, r.text
             body = r.json()
             assert body["error"]["type"] == "invalid_request_id"
-            assert "x-request-id" not in {k.lower() for k in r.headers.keys()} or \
-                r.headers.get("x-request-id") in (None, "")
+            # 被拒请求带本次专属标识（新生成），且与响应体一致、不回显非法原值
+            rejection_id = r.headers["x-request-id"]
+            assert GENERATED_RE.match(rejection_id)
+            assert body["request_id"] == rejection_id
+            assert rejection_id != inbound
             counts["invalid"] += 1
         else:
             assert r.status_code == 200
